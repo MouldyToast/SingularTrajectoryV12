@@ -242,11 +242,11 @@ class CursorTrajectoryDataset(Dataset):
         self.scene_name = os.path.basename(data_dir.rstrip('/'))
 
         # Load vector field if available (flat structure: data_dir/vector_field.npy)
+        # Store as dict keyed by scene_name (like original TrajectoryDataset)
+        self.vector_field = {}
         vf_path = os.path.join(data_dir, "vector_field.npy")
         if os.path.exists(vf_path):
-            self.vector_field = np.load(vf_path)
-        else:
-            self.vector_field = None
+            self.vector_field[self.scene_name] = np.load(vf_path)
 
         # Load trajectory file
         if os.path.exists(data_file):
