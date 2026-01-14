@@ -13,11 +13,11 @@ import os
 import argparse
 import baseline
 from SingularTrajectory import SingularTrajectory
+from utils.cursor_trainer import CursorTransformerDiffusionTrainer
 from utils import (
     DotDict,
     get_exp_config,
     print_arguments,
-    CursorTransformerDiffusionTrainer
 )
 
 
