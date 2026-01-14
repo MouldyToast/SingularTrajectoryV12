@@ -3,7 +3,11 @@ import pickle
 import torch
 import numpy as np
 from tqdm import tqdm
-from . import *
+
+# Explicit imports to avoid circular import issues
+from .utils import reproducibility_settings, DotDict, augment_trajectory
+from .metrics import compute_batch_ade, compute_batch_fde, AverageMeter
+from .dataloader import get_dataloader
 
 
 class STTrainer:
