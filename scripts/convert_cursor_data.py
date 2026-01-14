@@ -206,13 +206,9 @@ def convert_trajectories(input_dir, output_dir, normalize=True, seed=42):
 
         print(f"\n{group_name} split: train={len(splits['train'])}, val={len(splits['val'])}, test={len(splits['test'])}")
 
-        # Write each split to file
+        # Write each split to file (flat structure: group_dir/split.txt)
         for split_name, split_trajectories in splits.items():
-            # Create split directory
-            split_dir = os.path.join(group_dir, split_name)
-            os.makedirs(split_dir, exist_ok=True)
-
-            output_file = os.path.join(split_dir, f"{group_name}_{split_name}.txt")
+            output_file = os.path.join(group_dir, f"{split_name}.txt")
 
             with open(output_file, 'w') as f:
                 for traj_idx, traj in enumerate(split_trajectories, start=1):

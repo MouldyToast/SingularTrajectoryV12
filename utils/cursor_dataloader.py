@@ -34,7 +34,8 @@ def get_cursor_dataloader(data_dir, phase, obs_len, pred_len, batch_size, skip=1
     """
     assert phase in ['train', 'val', 'test']
 
-    data_path = os.path.join(data_dir, phase)
+    # Flat structure: data_dir contains {train,val,test}.txt files directly
+    data_file = os.path.join(data_dir, f"{phase}.txt")
     shuffle = phase == 'train'
     drop_last = phase == 'train'
 
@@ -42,7 +43,8 @@ def get_cursor_dataloader(data_dir, phase, obs_len, pred_len, batch_size, skip=1
         max_traj_len = obs_len + pred_len
 
     dataset = CursorTrajectoryDataset(
-        data_dir=data_path,
+        data_file=data_file,
+        data_dir=data_dir,
         obs_len=obs_len,
         pred_len=pred_len,
         skip=skip,
@@ -205,11 +207,12 @@ class CursorTrajectoryDataset(Dataset):
     Handles variable-length trajectories with padding/truncation.
     """
 
-    def __init__(self, data_dir, obs_len=3, pred_len=25, skip=1, max_traj_len=None,
+    def __init__(self, data_file, data_dir, obs_len=3, pred_len=25, skip=1, max_traj_len=None,
                  threshold=0.02, delim='\t'):
         """
         Args:
-            data_dir: Directory containing trajectory files
+            data_file: Path to the trajectory file (e.g., train.txt)
+            data_dir: Path to the group directory (for loading vector field)
             obs_len: Number of observed time steps
             pred_len: Number of predicted time steps
             skip: Frame skip
@@ -219,6 +222,7 @@ class CursorTrajectoryDataset(Dataset):
         """
         super().__init__()
 
+        self.data_file = data_file
         self.data_dir = data_dir
         self.obs_len = obs_len
         self.pred_len = pred_len
@@ -234,25 +238,19 @@ class CursorTrajectoryDataset(Dataset):
         self.non_linear = []
         self.scene_ids = []
 
-        # Get scene name from path
-        parent_dir = os.path.dirname(data_dir.rstrip('/'))
-        self.scene_name = os.path.basename(parent_dir)
+        # Get scene name from data_dir (the group name like "Medium")
+        self.scene_name = os.path.basename(data_dir.rstrip('/'))
 
-        # Load vector field if available
-        vectorfield_dir = os.path.join(os.path.dirname(parent_dir), "vectorfield")
-        vf_path = os.path.join(vectorfield_dir, f"cursor_{self.scene_name}_vector_field.npy")
+        # Load vector field if available (flat structure: data_dir/vector_field.npy)
+        vf_path = os.path.join(data_dir, "vector_field.npy")
         if os.path.exists(vf_path):
             self.vector_field = np.load(vf_path)
         else:
             self.vector_field = None
 
-        # Load all trajectory files
-        if os.path.exists(data_dir):
-            all_files = sorted([f for f in os.listdir(data_dir) if f.endswith('.txt')])
-            all_files = [os.path.join(data_dir, f) for f in all_files]
-
-            for path in all_files:
-                self._load_file(path)
+        # Load trajectory file
+        if os.path.exists(data_file):
+            self._load_file(data_file)
 
         # Convert to arrays
         self.num_trajectories = len(self.trajectories)

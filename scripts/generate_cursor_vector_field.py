@@ -33,20 +33,18 @@ def load_trajectories(data_dir, group_name):
     """
     Load all trajectories for a distance group (train + val + test).
 
+    Expects flat structure: data_dir/group_name/{train,val,test}.txt
+
     Returns list of trajectories, each as numpy array of shape (n_points, 2)
     """
     trajectories = []
+    group_dir = os.path.join(data_dir, group_name)
 
     for split in ["train", "val", "test"]:
-        split_dir = os.path.join(data_dir, group_name, split)
-        if not os.path.exists(split_dir):
-            continue
-
-        # Find trajectory file
-        for filename in os.listdir(split_dir):
-            if filename.endswith(".txt"):
-                filepath = os.path.join(split_dir, filename)
-                trajectories.extend(parse_trajectory_file(filepath))
+        # Look for split.txt directly in group directory
+        filepath = os.path.join(group_dir, f"{split}.txt")
+        if os.path.exists(filepath):
+            trajectories.extend(parse_trajectory_file(filepath))
 
     return trajectories
 
@@ -208,10 +206,6 @@ def generate_vector_fields(data_dir, output_dir=None, visualize=False):
     if output_dir is None:
         output_dir = data_dir
 
-    # Create vectorfield directory
-    vectorfield_dir = os.path.join(os.path.dirname(data_dir.rstrip('/')), "vectorfield")
-    os.makedirs(vectorfield_dir, exist_ok=True)
-
     for group_name in DISTANCE_GROUPS:
         group_dir = os.path.join(data_dir, group_name)
         if not os.path.exists(group_dir):
@@ -237,20 +231,18 @@ def generate_vector_fields(data_dir, output_dir=None, visualize=False):
         vector_field_interp, density_interp = interpolate_empty_cells(vector_field, density_field)
         print(f"  After interpolation: {np.sum(density_interp > 0)} / {density_interp.size}")
 
-        # Save vector field
-        # Format matches original: shape (H, W, 2) where [:,:,0] is target_y, [:,:,1] is target_x
-        # But for cursor we store direction vectors directly
-        output_file = os.path.join(vectorfield_dir, f"cursor_{group_name}_vector_field.npy")
+        # Save vector field inside the group directory
+        output_file = os.path.join(group_dir, "vector_field.npy")
         np.save(output_file, vector_field_interp)
         print(f"  Saved: {output_file}")
 
         # Also save density field for analysis
-        density_file = os.path.join(vectorfield_dir, f"cursor_{group_name}_density.npy")
+        density_file = os.path.join(group_dir, "density.npy")
         np.save(density_file, density_interp)
 
         # Save visualization if requested
         if visualize:
-            save_visualization(vector_field_interp, density_interp, group_name, vectorfield_dir)
+            save_visualization(vector_field_interp, density_interp, group_name, group_dir)
 
 
 def save_visualization(vector_field, density_field, group_name, output_dir):
@@ -290,7 +282,7 @@ def save_visualization(vector_field, density_field, group_name, output_dir):
     ax.set_aspect('equal')
 
     plt.tight_layout()
-    output_file = os.path.join(output_dir, f"cursor_{group_name}_visualization.png")
+    output_file = os.path.join(output_dir, "vector_field_visualization.png")
     plt.savefig(output_file, dpi=150)
     plt.close()
     print(f"  Visualization: {output_file}")
