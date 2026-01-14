@@ -200,9 +200,9 @@ class CursorTransformerDiffusionTrainer(STTrainer):
         s = self.model.s
         anchor = torch.zeros((n_traj, k, s), dtype=torch.float)
 
-        # Get base anchors from model
-        C_anchor_m = self.model.adaptive_anchor_m.C_anchor.detach()
-        C_anchor_s = self.model.adaptive_anchor_s.C_anchor.detach()
+        # Get base anchors from model (move to CPU since anchor tensor is on CPU)
+        C_anchor_m = self.model.adaptive_anchor_m.C_anchor.detach().cpu()
+        C_anchor_s = self.model.adaptive_anchor_s.C_anchor.detach().cpu()
 
         n_moving = mask.sum().item()
         n_static = (~mask).sum().item()
