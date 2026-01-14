@@ -258,11 +258,48 @@ class CursorTrajectoryDataset(Dataset):
         self.non_linear = np.array(self.non_linear)
         self.scene_ids = np.array(self.scene_ids)
 
+        # Build obs_traj and pred_traj tensors for trainer compatibility
+        # These are needed by init_descriptor() and calculate_adaptive_anchor()
+        self._build_trajectory_tensors()
+
         # Anchor placeholder (set by trainer)
         self.anchor = None
 
+        # Homography placeholder (identity for cursor - screen coords = world coords)
+        # Used by adaptive anchor calculation
+        self.homography = {self.scene_name: np.eye(3)}
+
         # For compatibility with batch sampler
         self.num_peds_in_seq = np.ones(self.num_trajectories, dtype=np.int32)
+
+        # Alias for compatibility
+        self.scene_id = self.scene_ids
+
+    def _build_trajectory_tensors(self):
+        """Build obs_traj and pred_traj tensors from loaded trajectories.
+
+        Required for trainer's init_descriptor() and calculate_adaptive_anchor().
+        """
+        if self.num_trajectories == 0:
+            self.obs_traj = torch.zeros((0, self.obs_len, 2))
+            self.pred_traj = torch.zeros((0, self.pred_len, 2))
+            return
+
+        obs_list = []
+        pred_list = []
+
+        for traj in self.trajectories:
+            # Pad if needed
+            if len(traj) < self.seq_len:
+                padded = np.zeros((self.seq_len, 2))
+                padded[:len(traj)] = traj
+                traj = padded
+
+            obs_list.append(traj[:self.obs_len])
+            pred_list.append(traj[self.obs_len:self.seq_len])
+
+        self.obs_traj = torch.from_numpy(np.array(obs_list)).float()  # (N, obs_len, 2)
+        self.pred_traj = torch.from_numpy(np.array(pred_list)).float()  # (N, pred_len, 2)
 
     def _load_file(self, path):
         """Load trajectories from a single file."""
