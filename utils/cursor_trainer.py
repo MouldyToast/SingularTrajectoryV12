@@ -88,7 +88,95 @@ class CursorTransformerDiffusionTrainer(STTrainer):
                 gamma=hyper_params.lr_schd_gamma
             )
 
-    # init_descriptor is inherited from STTrainer - works as-is
+    def init_descriptor(self):
+        """Initialize Singular space and anchors for cursor data.
+
+        Override parent to handle the case where one trajectory category
+        (moving or static) may be empty. For cursor data, typically ALL
+        trajectories are "moving" since they represent mouse movements.
+        """
+        from .utils import augment_trajectory
+
+        print("Singular space initialization...")
+        obs_traj = self.loader_train.dataset.obs_traj
+        pred_traj = self.loader_train.dataset.pred_traj
+
+        # Augment trajectories (rotation augmentation)
+        obs_traj, pred_traj = augment_trajectory(obs_traj, pred_traj)
+
+        # Split into moving and static categories
+        mask = self.model.calculate_mask(obs_traj)
+        n_moving = mask.sum().item()
+        n_static = (~mask).sum().item()
+
+        print(f"  Moving trajectories: {n_moving}")
+        print(f"  Static trajectories: {n_static}")
+
+        obs_m_traj, pred_m_traj = obs_traj[mask], pred_traj[mask]
+        obs_s_traj, pred_s_traj = obs_traj[~mask], pred_traj[~mask]
+
+        # Initialize moving trajectories (if any)
+        if n_moving >= self.hyper_params.num_samples:
+            print("  Initializing moving trajectory space...")
+            data_m = self.model.Singular_space_m.parameter_initialization(obs_m_traj, pred_m_traj)
+            self.model.adaptive_anchor_m.anchor_initialization(*data_m)
+        elif n_moving > 0:
+            print(f"  Warning: Only {n_moving} moving trajectories, need {self.hyper_params.num_samples} for KMeans")
+            print("  Using all moving trajectories as anchor samples...")
+            data_m = self.model.Singular_space_m.parameter_initialization(obs_m_traj, pred_m_traj)
+            # Use fewer clusters if we have fewer samples
+            self._anchor_init_with_limited_samples(
+                self.model.adaptive_anchor_m,
+                data_m[0], data_m[1],
+                n_moving
+            )
+        else:
+            print("  No moving trajectories - skipping moving space initialization")
+
+        # Initialize static trajectories (if any)
+        if n_static >= self.hyper_params.num_samples:
+            print("  Initializing static trajectory space...")
+            data_s = self.model.Singular_space_s.parameter_initialization(obs_s_traj, pred_s_traj)
+            self.model.adaptive_anchor_s.anchor_initialization(*data_s)
+        elif n_static > 0:
+            print(f"  Warning: Only {n_static} static trajectories, need {self.hyper_params.num_samples} for KMeans")
+            print("  Using all static trajectories as anchor samples...")
+            data_s = self.model.Singular_space_s.parameter_initialization(obs_s_traj, pred_s_traj)
+            self._anchor_init_with_limited_samples(
+                self.model.adaptive_anchor_s,
+                data_s[0], data_s[1],
+                n_static
+            )
+        else:
+            print("  No static trajectories - skipping static space initialization")
+
+        print("Anchor generation complete.")
+
+    def _anchor_init_with_limited_samples(self, anchor_module, pred_traj_norm, V_pred_trunc, n_samples):
+        """Initialize anchors when we have fewer samples than num_samples.
+
+        Uses all available samples as anchors instead of KMeans clustering.
+        """
+        from sklearn.cluster import KMeans
+        import torch.nn as nn
+
+        # Project trajectories to Singular space
+        C_pred = anchor_module.to_Singular_space(pred_traj_norm, evec=V_pred_trunc).T.detach().numpy()
+
+        # Use KMeans with n_clusters = min(n_samples, num_samples)
+        n_clusters = min(n_samples, anchor_module.s)
+        C_anchor = torch.FloatTensor(
+            KMeans(n_clusters=n_clusters, random_state=0, init='k-means++', n_init=1)
+            .fit(C_pred).cluster_centers_.T
+        )
+
+        # Pad with zeros if we have fewer clusters than expected
+        if n_clusters < anchor_module.s:
+            padded = torch.zeros((anchor_module.k, anchor_module.s))
+            padded[:, :n_clusters] = C_anchor
+            C_anchor = padded
+
+        anchor_module.C_anchor = nn.Parameter(C_anchor.to(anchor_module.C_anchor.device))
 
     def init_adaptive_anchor(self, dataset):
         """Initialize adaptive anchors for cursor dataset.
