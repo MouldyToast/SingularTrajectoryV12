@@ -145,7 +145,9 @@ def generate_cursor_trajectories(
     start,
     end,
     num_samples=20,
-    device='cuda'
+    device='cuda',
+    adjust_endpoint=True,
+    adjust_method='warp'
 ):
     """Generate cursor trajectories between start and end points.
 
@@ -156,6 +158,8 @@ def generate_cursor_trajectories(
         end: (x, y) end point in pixels
         num_samples: Number of trajectory samples to generate
         device: Computation device
+        adjust_endpoint: If True, adjust trajectories to hit the target endpoint
+        adjust_method: Method for endpoint adjustment ('warp', 'scale_rotate', 'scale_last')
 
     Returns:
         trajectories: List of numpy arrays, each of shape (seq_len, 2)
@@ -231,6 +235,10 @@ def generate_cursor_trajectories(
         obs = obs_traj.squeeze(0).cpu().numpy()
         full_traj = np.vstack([obs, traj])
 
+        # Adjust trajectory to hit target endpoint
+        if adjust_endpoint:
+            full_traj = adjust_trajectory_to_endpoint(full_traj, start, end, method=adjust_method)
+
         trajectories.append(full_traj)
 
     return trajectories
@@ -250,6 +258,91 @@ def interpolate_trajectory(trajectory, num_points):
     fy = interpolate.interp1d(t_orig, trajectory[:, 1], kind='cubic')
 
     return np.column_stack([fx(t_new), fy(t_new)])
+
+
+def adjust_trajectory_to_endpoint(trajectory, start, target_end, method='scale_rotate'):
+    """Adjust trajectory so it ends at the target endpoint.
+
+    The model generates trajectories based on learned patterns, but doesn't
+    explicitly target a specific endpoint. This function adjusts the trajectory
+    to reach the desired endpoint while preserving its shape characteristics.
+
+    Args:
+        trajectory: numpy array of shape (T, 2)
+        start: numpy array of shape (2,) - start point
+        target_end: numpy array of shape (2,) - desired endpoint
+        method: 'scale_rotate' or 'scale_last' or 'warp'
+
+    Returns:
+        Adjusted trajectory of shape (T, 2)
+    """
+    actual_end = trajectory[-1]
+
+    if method == 'scale_rotate':
+        # Scale and rotate entire trajectory to hit target
+        actual_vec = actual_end - start
+        target_vec = target_end - start
+
+        actual_dist = np.linalg.norm(actual_vec)
+        target_dist = np.linalg.norm(target_vec)
+
+        if actual_dist < 1e-6:
+            # Degenerate case - just return line to target
+            t = np.linspace(0, 1, len(trajectory))
+            return np.column_stack([
+                start[0] + t * (target_end[0] - start[0]),
+                start[1] + t * (target_end[1] - start[1])
+            ])
+
+        # Scale factor
+        scale = target_dist / actual_dist
+
+        # Rotation angle
+        actual_angle = np.arctan2(actual_vec[1], actual_vec[0])
+        target_angle = np.arctan2(target_vec[1], target_vec[0])
+        rotation = target_angle - actual_angle
+
+        # Apply transformation
+        adjusted = np.zeros_like(trajectory)
+        cos_r, sin_r = np.cos(rotation), np.sin(rotation)
+
+        for i, pt in enumerate(trajectory):
+            # Translate to origin
+            vec = pt - start
+            # Rotate
+            rotated = np.array([
+                vec[0] * cos_r - vec[1] * sin_r,
+                vec[0] * sin_r + vec[1] * cos_r
+            ])
+            # Scale and translate back
+            adjusted[i] = start + rotated * scale
+
+        return adjusted
+
+    elif method == 'warp':
+        # Progressively warp trajectory toward target
+        # Preserves start, smoothly adjusts to hit end
+        adjusted = trajectory.copy()
+        diff = target_end - actual_end
+
+        for i in range(len(trajectory)):
+            # Interpolation weight increases toward end
+            t = i / (len(trajectory) - 1) if len(trajectory) > 1 else 1.0
+            # Use smooth easing (cubic)
+            weight = t * t * (3 - 2 * t)
+            adjusted[i] = trajectory[i] + diff * weight
+
+        return adjusted
+
+    else:  # scale_last
+        # Only adjust last portion to hit target
+        adjusted = trajectory.copy()
+        # Adjust last 25% of trajectory
+        adjust_start = int(len(trajectory) * 0.75)
+        for i in range(adjust_start, len(trajectory)):
+            t = (i - adjust_start) / (len(trajectory) - 1 - adjust_start)
+            adjusted[i] = trajectory[i] * (1 - t) + target_end * t
+        return adjusted
 
 
 def save_trajectories(trajectories, output_path, start, end):
@@ -335,6 +428,12 @@ def main():
                         help="Output plot image path")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device to use (cuda/cpu)")
+    parser.add_argument("--no-adjust", dest="adjust_endpoint", action="store_false",
+                        help="Disable endpoint adjustment (trajectories may not hit target)")
+    parser.add_argument("--adjust-method", type=str, default="warp",
+                        choices=["warp", "scale_rotate", "scale_last"],
+                        help="Method for adjusting trajectories to hit endpoint")
+    parser.set_defaults(adjust_endpoint=True)
 
     args = parser.parse_args()
 
@@ -374,13 +473,16 @@ def main():
 
     # Generate trajectories
     print("\nGenerating trajectories...")
+    print(f"  Endpoint adjustment: {args.adjust_endpoint} (method: {args.adjust_method})")
     trajectories = generate_cursor_trajectories(
         model=model,
         hyper_params=hyper_params,
         start=start,
         end=end,
         num_samples=args.num_samples,
-        device=device
+        device=device,
+        adjust_endpoint=args.adjust_endpoint,
+        adjust_method=args.adjust_method
     )
     print(f"Generated {len(trajectories)} trajectories")
 
