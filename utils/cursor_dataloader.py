@@ -258,9 +258,15 @@ class CursorTrajectoryDataset(Dataset):
         self.non_linear = np.array(self.non_linear)
         self.scene_ids = np.array(self.scene_ids)
 
+        # Initialize obs_traj and pred_traj to empty tensors (will be overwritten)
+        # This ensures attributes exist even if _build_trajectory_tensors fails
+        self.obs_traj = torch.zeros((0, self.obs_len, 2))
+        self.pred_traj = torch.zeros((0, self.pred_len, 2))
+
         # Build obs_traj and pred_traj tensors for trainer compatibility
         # These are needed by init_descriptor() and calculate_adaptive_anchor()
-        self._build_trajectory_tensors()
+        if self.num_trajectories > 0:
+            self._build_trajectory_tensors()
 
         # Anchor placeholder (set by trainer)
         self.anchor = None
@@ -279,12 +285,8 @@ class CursorTrajectoryDataset(Dataset):
         """Build obs_traj and pred_traj tensors from loaded trajectories.
 
         Required for trainer's init_descriptor() and calculate_adaptive_anchor().
+        Called only when num_trajectories > 0.
         """
-        if self.num_trajectories == 0:
-            self.obs_traj = torch.zeros((0, self.obs_len, 2))
-            self.pred_traj = torch.zeros((0, self.pred_len, 2))
-            return
-
         obs_list = []
         pred_list = []
 
