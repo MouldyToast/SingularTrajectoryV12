@@ -59,7 +59,7 @@ def load_model(checkpoint_dir, device='cuda'):
     """
     import baseline
     from SingularTrajectory import SingularTrajectory
-    from utils import DotDict
+    from utils.utils import DotDict
 
     # Load config
     config_path = os.path.join(checkpoint_dir, 'config.pkl')
