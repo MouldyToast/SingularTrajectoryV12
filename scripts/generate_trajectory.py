@@ -139,6 +139,65 @@ def create_synthetic_observation(start, end, obs_len=3):
     return torch.from_numpy(obs).unsqueeze(0)  # Shape: (1, obs_len, 2)
 
 
+def estimate_trajectory_length(distance, min_points=10, max_points=100, pixels_per_point=5.0):
+    """Estimate appropriate trajectory length based on pixel distance.
+
+    Cursor movements should have point density proportional to distance:
+    - Short movements (50px): ~10 points
+    - Medium movements (200px): ~40 points
+    - Long movements (500px): ~100 points
+
+    Args:
+        distance: Pixel distance between start and end
+        min_points: Minimum number of trajectory points
+        max_points: Maximum number of trajectory points
+        pixels_per_point: Target pixels between consecutive points
+
+    Returns:
+        Estimated number of trajectory points
+    """
+    estimated = int(distance / pixels_per_point)
+    return max(min_points, min(max_points, estimated))
+
+
+def resample_trajectory(trajectory, target_length):
+    """Resample trajectory to target number of points.
+
+    Uses cubic interpolation to create smooth resampled trajectory.
+
+    Args:
+        trajectory: numpy array of shape (T, 2)
+        target_length: Desired number of points
+
+    Returns:
+        Resampled trajectory of shape (target_length, 2)
+    """
+    from scipy import interpolate
+
+    if len(trajectory) == target_length:
+        return trajectory
+
+    if len(trajectory) < 2:
+        return np.tile(trajectory[0], (target_length, 1))
+
+    # Parameterize by normalized arc length
+    t_orig = np.linspace(0, 1, len(trajectory))
+    t_new = np.linspace(0, 1, target_length)
+
+    # Use cubic interpolation if enough points, else linear
+    kind = 'cubic' if len(trajectory) >= 4 else 'linear'
+
+    try:
+        fx = interpolate.interp1d(t_orig, trajectory[:, 0], kind=kind)
+        fy = interpolate.interp1d(t_orig, trajectory[:, 1], kind=kind)
+        return np.column_stack([fx(t_new), fy(t_new)])
+    except Exception:
+        # Fallback to linear
+        fx = interpolate.interp1d(t_orig, trajectory[:, 0], kind='linear')
+        fy = interpolate.interp1d(t_orig, trajectory[:, 1], kind='linear')
+        return np.column_stack([fx(t_new), fy(t_new)])
+
+
 def generate_cursor_trajectories(
     model,
     hyper_params,
@@ -147,7 +206,10 @@ def generate_cursor_trajectories(
     num_samples=20,
     device='cuda',
     adjust_endpoint=True,
-    adjust_method='warp'
+    adjust_method='warp',
+    adaptive_length=True,
+    target_length=None,
+    pixels_per_point=5.0
 ):
     """Generate cursor trajectories between start and end points.
 
@@ -160,9 +222,13 @@ def generate_cursor_trajectories(
         device: Computation device
         adjust_endpoint: If True, adjust trajectories to hit the target endpoint
         adjust_method: Method for endpoint adjustment ('warp', 'scale_rotate', 'scale_last')
+        adaptive_length: If True, resample trajectories to distance-appropriate length
+        target_length: Override trajectory length (if None, estimated from distance)
+        pixels_per_point: Target pixel spacing between points (for adaptive_length)
 
     Returns:
-        trajectories: List of numpy arrays, each of shape (seq_len, 2)
+        trajectories: List of numpy arrays, each of shape (traj_len, 2)
+            where traj_len varies based on distance if adaptive_length=True
 
     Note:
         The model internally handles normalization/denormalization via TrajNorm.
@@ -171,6 +237,9 @@ def generate_cursor_trajectories(
     """
     start = np.array(start, dtype=np.float32)
     end = np.array(end, dtype=np.float32)
+
+    # Calculate distance for adaptive length
+    distance = np.linalg.norm(end - start)
 
     # Create synthetic observation in RAW pixel coordinates
     # The observation points from start toward end, giving the model direction
@@ -214,6 +283,20 @@ def generate_cursor_trajectories(
     if pred_traj.dim() == 3:
         pred_traj = pred_traj.unsqueeze(0)
 
+    # Determine target trajectory length
+    if adaptive_length:
+        if target_length is not None:
+            traj_length = target_length
+        else:
+            traj_length = estimate_trajectory_length(
+                distance,
+                min_points=10,
+                max_points=100,
+                pixels_per_point=pixels_per_point
+            )
+    else:
+        traj_length = None  # Keep original length
+
     # Build full trajectories
     trajectories = []
     obs_np = obs_traj.squeeze(0).cpu().numpy()
@@ -230,6 +313,10 @@ def generate_cursor_trajectories(
         # Adjust trajectory to hit target endpoint
         if adjust_endpoint:
             full_traj = adjust_trajectory_to_endpoint(full_traj, start, end, method=adjust_method)
+
+        # Resample to adaptive length
+        if traj_length is not None and len(full_traj) != traj_length:
+            full_traj = resample_trajectory(full_traj, traj_length)
 
         trajectories.append(full_traj)
 
@@ -500,7 +587,13 @@ def main():
     parser.add_argument("--selection-method", type=str, default="balanced",
                         choices=["efficiency", "smoothness", "balanced", "median"],
                         help="Method for selecting best trajectory in deterministic mode")
-    parser.set_defaults(adjust_endpoint=True)
+    parser.add_argument("--no-adaptive-length", dest="adaptive_length", action="store_false",
+                        help="Disable adaptive trajectory length (use fixed model output length)")
+    parser.add_argument("--target-length", type=int, default=None,
+                        help="Override trajectory length (number of points)")
+    parser.add_argument("--pixels-per-point", type=float, default=5.0,
+                        help="Target pixel spacing between points for adaptive length")
+    parser.set_defaults(adjust_endpoint=True, adaptive_length=True)
 
     args = parser.parse_args()
 
@@ -538,9 +631,21 @@ def main():
     model, hyper_params = load_model(args.checkpoint, device)
     print(f"Model loaded from {args.checkpoint}")
 
+    # Estimate trajectory length for display
+    if args.adaptive_length:
+        if args.target_length:
+            estimated_length = args.target_length
+        else:
+            estimated_length = estimate_trajectory_length(
+                distance, pixels_per_point=args.pixels_per_point
+            )
+    else:
+        estimated_length = hyper_params.obs_len + hyper_params.pred_len
+
     # Generate trajectories
     print("\nGenerating trajectories...")
     print(f"  Endpoint adjustment: {args.adjust_endpoint} (method: {args.adjust_method})")
+    print(f"  Adaptive length: {args.adaptive_length} ({estimated_length} points)")
     print(f"  Mode: {'Deterministic' if args.deterministic else 'Stochastic'}")
     if args.deterministic:
         print(f"  Selection method: {args.selection_method}")
@@ -553,7 +658,10 @@ def main():
         num_samples=args.num_samples,
         device=device,
         adjust_endpoint=args.adjust_endpoint,
-        adjust_method=args.adjust_method
+        adjust_method=args.adjust_method,
+        adaptive_length=args.adaptive_length,
+        target_length=args.target_length,
+        pixels_per_point=args.pixels_per_point
     )
     print(f"Generated {len(trajectories)} trajectory samples")
 
