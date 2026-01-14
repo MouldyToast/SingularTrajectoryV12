@@ -260,6 +260,76 @@ def interpolate_trajectory(trajectory, num_points):
     return np.column_stack([fx(t_new), fy(t_new)])
 
 
+def select_best_trajectory(trajectories, start, end, method='efficiency'):
+    """Select the best trajectory from a set of stochastic samples.
+
+    This implements the deterministic mode - given multiple trajectory samples,
+    select the one that best fits the criteria.
+
+    Args:
+        trajectories: List of numpy arrays, each shape (T, 2)
+        start: Start point (x, y)
+        end: End point (x, y)
+        method: Selection method:
+            - 'efficiency': Most direct path (highest path efficiency)
+            - 'smoothness': Smoothest trajectory (lowest curvature variation)
+            - 'balanced': Combined score of efficiency and smoothness
+            - 'median': Trajectory closest to the mean of all samples
+
+    Returns:
+        Best trajectory as numpy array (T, 2)
+    """
+    if len(trajectories) == 1:
+        return trajectories[0]
+
+    start = np.array(start)
+    end = np.array(end)
+    ideal_dist = np.linalg.norm(end - start)
+
+    scores = []
+
+    for traj in trajectories:
+        # Path efficiency: ideal_dist / actual_path_length
+        path_length = np.sum(np.linalg.norm(np.diff(traj, axis=0), axis=1))
+        efficiency = ideal_dist / max(path_length, 1e-6)
+
+        # Smoothness: inverse of curvature variation
+        if len(traj) >= 3:
+            # Calculate velocity vectors
+            velocities = np.diff(traj, axis=0)
+            # Calculate acceleration (change in velocity)
+            accelerations = np.diff(velocities, axis=0)
+            # Smoothness as inverse of mean acceleration magnitude
+            accel_mag = np.linalg.norm(accelerations, axis=1)
+            smoothness = 1.0 / (np.mean(accel_mag) + 1e-6)
+        else:
+            smoothness = 1.0
+
+        # ADE to direct line (for median method)
+        t_vals = np.linspace(0, 1, len(traj))
+        direct_line = np.column_stack([
+            start[0] + t_vals * (end[0] - start[0]),
+            start[1] + t_vals * (end[1] - start[1])
+        ])
+        ade_to_line = np.mean(np.linalg.norm(traj - direct_line, axis=1))
+
+        if method == 'efficiency':
+            score = efficiency
+        elif method == 'smoothness':
+            score = smoothness
+        elif method == 'balanced':
+            # Normalize and combine (efficiency is typically 0-1, smoothness varies)
+            score = efficiency * 0.6 + min(smoothness / 100, 1.0) * 0.4
+        else:  # median - find trajectory closest to mean
+            score = -ade_to_line  # Negative because we want minimum ADE
+
+        scores.append(score)
+
+    # Select trajectory with highest score
+    best_idx = np.argmax(scores)
+    return trajectories[best_idx]
+
+
 def adjust_trajectory_to_endpoint(trajectory, start, target_end, method='scale_rotate'):
     """Adjust trajectory so it ends at the target endpoint.
 
@@ -433,6 +503,11 @@ def main():
     parser.add_argument("--adjust-method", type=str, default="warp",
                         choices=["warp", "scale_rotate", "scale_last"],
                         help="Method for adjusting trajectories to hit endpoint")
+    parser.add_argument("--deterministic", "-d", action="store_true",
+                        help="Deterministic mode: select single best trajectory from samples")
+    parser.add_argument("--selection-method", type=str, default="balanced",
+                        choices=["efficiency", "smoothness", "balanced", "median"],
+                        help="Method for selecting best trajectory in deterministic mode")
     parser.set_defaults(adjust_endpoint=True)
 
     args = parser.parse_args()
@@ -474,6 +549,10 @@ def main():
     # Generate trajectories
     print("\nGenerating trajectories...")
     print(f"  Endpoint adjustment: {args.adjust_endpoint} (method: {args.adjust_method})")
+    print(f"  Mode: {'Deterministic' if args.deterministic else 'Stochastic'}")
+    if args.deterministic:
+        print(f"  Selection method: {args.selection_method}")
+
     trajectories = generate_cursor_trajectories(
         model=model,
         hyper_params=hyper_params,
@@ -484,7 +563,15 @@ def main():
         adjust_endpoint=args.adjust_endpoint,
         adjust_method=args.adjust_method
     )
-    print(f"Generated {len(trajectories)} trajectories")
+    print(f"Generated {len(trajectories)} trajectory samples")
+
+    # Apply deterministic selection if requested
+    if args.deterministic:
+        best_traj = select_best_trajectory(
+            trajectories, start, end, method=args.selection_method
+        )
+        trajectories = [best_traj]
+        print(f"Selected best trajectory (method: {args.selection_method})")
 
     # Save output
     if args.output:
@@ -497,6 +584,10 @@ def main():
     # Print summary
     print("\n" + "=" * 60)
     print("Summary:")
+    if args.deterministic:
+        print(f"  Mode: Deterministic (1 trajectory selected from {args.num_samples} samples)")
+    else:
+        print(f"  Mode: Stochastic ({len(trajectories)} diverse trajectories)")
     lengths = [len(t) for t in trajectories]
     print(f"  Trajectory lengths: min={min(lengths)}, max={max(lengths)}, avg={np.mean(lengths):.1f}")
 
