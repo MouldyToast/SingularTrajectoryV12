@@ -181,13 +181,140 @@ class CursorTransformerDiffusionTrainer(STTrainer):
     def init_adaptive_anchor(self, dataset):
         """Initialize adaptive anchors for cursor dataset.
 
-        For cursor data, we use base anchors (no scene-specific adaptation).
-        Vector field adaptation can be added later.
+        Uses vector field to adapt anchor endpoints based on scene flow.
         """
         print("Adaptive anchor initialization...")
 
-        # Use base anchors (the KMeans cluster centers)
-        dataset.anchor = self._calculate_base_anchor(dataset)
+        # Check if vector field is available
+        if dataset.vector_field and len(dataset.vector_field) > 0:
+            print("  Using vector field adaptation...")
+            dataset.anchor = self._calculate_adaptive_anchor(dataset)
+        else:
+            print("  No vector field - using base anchors...")
+            dataset.anchor = self._calculate_base_anchor(dataset)
+
+    def _calculate_adaptive_anchor(self, dataset):
+        """Calculate adaptive anchors using vector field (like original).
+
+        For cursor data:
+        - Screen coordinates are used directly (no homography)
+        - Vector field guides trajectory endpoints
+        """
+        obs_traj = dataset.obs_traj
+        pred_traj = dataset.pred_traj
+        scene_id = dataset.scene_id
+        vector_field = dataset.vector_field
+        homography = dataset.homography  # Identity for cursor
+
+        n_traj = obs_traj.size(0)
+        mask = self.model.calculate_mask(obs_traj)
+
+        k = self.model.k
+        s = self.model.s
+        anchor = torch.zeros((n_traj, k, s), dtype=torch.float)
+
+        # Calculate for moving trajectories
+        n_moving = mask.sum().item()
+        if n_moving > 0:
+            obs_m_traj = obs_traj[mask]
+            scene_id_m = scene_id[mask]
+            anchor[mask] = self._adaptive_anchor_with_vectorfield(
+                obs_m_traj, scene_id_m, vector_field, homography,
+                self.model.adaptive_anchor_m, self.model.Singular_space_m
+            )
+
+        # Calculate for static trajectories
+        n_static = (~mask).sum().item()
+        if n_static > 0:
+            obs_s_traj = obs_traj[~mask]
+            scene_id_s = scene_id[~mask]
+            anchor[~mask] = self._adaptive_anchor_with_vectorfield(
+                obs_s_traj, scene_id_s, vector_field, homography,
+                self.model.adaptive_anchor_s, self.model.Singular_space_s
+            )
+
+        return anchor
+
+    def _adaptive_anchor_with_vectorfield(self, obs_traj, scene_id, vector_field, homography, anchor_module, space):
+        """Cursor-specific adaptive anchor calculation.
+
+        Mirrors AdaptiveAnchor.adaptive_anchor_calculation but simplified for cursor:
+        - No world/image coordinate transform (identity homography)
+        - Vector field in normalized cursor space
+        """
+        n_ped = obs_traj.size(0)
+        V_trunc = space.V_trunc
+        s = anchor_module.s
+
+        # Calculate normalization params for this batch
+        space.traj_normalizer.calculate_params(obs_traj.cuda().detach())
+
+        # Get initial anchors and expand for each trajectory
+        init_anchor = anchor_module.C_anchor.unsqueeze(dim=0).repeat_interleave(repeats=n_ped, dim=0).detach()
+        init_anchor = init_anchor.permute(2, 1, 0)  # (s, k, n_ped)
+
+        # Convert to Euclidean space
+        init_anchor_euclidean = space.batch_to_Euclidean_space(init_anchor, evec=V_trunc)
+        init_anchor_euclidean = space.traj_normalizer.denormalize(init_anchor_euclidean).cpu().numpy()
+        adaptive_anchor_euclidean = init_anchor_euclidean.copy()
+        obs_traj_np = obs_traj.cpu().numpy()
+
+        # Get vector field for this scene
+        scene_name = scene_id[0] if len(scene_id) > 0 else None
+        vf = vector_field.get(scene_name) if scene_name else None
+
+        if vf is not None:
+            # Vector field grid parameters (from generate_cursor_vector_field.py)
+            # Normalized space: x in [-0.2, 1.2], y in [-0.6, 0.6]
+            grid_h, grid_w = vf.shape[:2]
+            x_min, x_max = -0.2, 1.2
+            y_min, y_max = -0.6, 0.6
+            cell_w = (x_max - x_min) / grid_w
+            cell_h = (y_max - y_min) / grid_h
+
+            for ped_id in range(n_ped):
+                startpoint = obs_traj_np[ped_id, -1]  # Last observed point
+
+                for sample_idx in range(s):
+                    # Get prototype trajectory endpoint
+                    prototype = init_anchor_euclidean[sample_idx, ped_id]  # (pred_len, 2)
+                    endpoint = prototype[-1]  # End of this anchor
+
+                    # Convert to grid coordinates
+                    grid_x = int((endpoint[0] - x_min) / cell_w)
+                    grid_y = int((endpoint[1] - y_min) / cell_h)
+
+                    # Clamp to grid bounds
+                    grid_x = max(0, min(grid_w - 1, grid_x))
+                    grid_y = max(0, min(grid_h - 1, grid_y))
+
+                    # Get flow target from vector field
+                    # vf[y, x] = (target_x, target_y) or (flow_dx, flow_dy)
+                    flow_target = vf[grid_y, grid_x]
+
+                    # Check if this is a valid flow (non-zero)
+                    if np.linalg.norm(flow_target) > 0.01:
+                        # Scale trajectory endpoints to match flow
+                        # Original approach: scale trajectory proportionally
+                        if np.linalg.norm(endpoint - startpoint) > 0.01:
+                            scale_xy = (flow_target - startpoint) / (endpoint - startpoint + 1e-6)
+                            # Clamp scale to reasonable range
+                            scale_xy = np.clip(scale_xy, 0.5, 2.0)
+
+                            # Apply scaling to entire trajectory
+                            for t in range(prototype.shape[0]):
+                                adaptive_anchor_euclidean[sample_idx, ped_id, t] = (
+                                    (prototype[t] - startpoint) * scale_xy + startpoint
+                                )
+
+        # Convert back to Singular space
+        adaptive_anchor_euclidean = space.traj_normalizer.normalize(
+            torch.FloatTensor(adaptive_anchor_euclidean).cuda()
+        )
+        adaptive_anchor = space.batch_to_Singular_space(adaptive_anchor_euclidean, evec=V_trunc)
+        adaptive_anchor = adaptive_anchor.permute(2, 1, 0).cpu()  # (n_ped, k, s)
+
+        return adaptive_anchor
 
     def _calculate_base_anchor(self, dataset):
         """Calculate anchors using pre-computed cluster centers (no vector field)."""
