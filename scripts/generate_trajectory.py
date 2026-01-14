@@ -163,27 +163,19 @@ def generate_cursor_trajectories(
 
     Returns:
         trajectories: List of numpy arrays, each of shape (seq_len, 2)
+
+    Note:
+        The model internally handles normalization/denormalization via TrajNorm.
+        We pass RAW (unnormalized) observations and get RAW outputs.
+        DO NOT pre-normalize with CursorTrajNorm - this causes double normalization!
     """
     start = np.array(start, dtype=np.float32)
     end = np.array(end, dtype=np.float32)
 
-    # Calculate distance for potential distance-group specific handling
-    distance = np.linalg.norm(end - start)
-
-    # Create normalizer
-    normalizer = CursorTrajNorm(ori=True, rot=True, sca=True)
-
-    # Create synthetic observation
+    # Create synthetic observation in RAW pixel coordinates
+    # The observation points from start toward end, giving the model direction
     obs_traj = create_synthetic_observation(start, end, hyper_params.obs_len)
     obs_traj = obs_traj.to(device)
-
-    # Calculate normalization parameters from start/end
-    start_tensor = torch.from_numpy(start).unsqueeze(0).to(device)  # (1, 2)
-    end_tensor = torch.from_numpy(end).unsqueeze(0).to(device)  # (1, 2)
-    normalizer.calculate_params_from_endpoints(start_tensor, end_tensor)
-
-    # Normalize observation
-    obs_traj_norm = normalizer.normalize(obs_traj)
 
     # Get anchor from model's pre-trained cluster centers
     # Anchors are in Singular space with shape (k, s) where k=num_components, s=num_samples
@@ -205,35 +197,35 @@ def generate_cursor_trajectories(
     }
 
     # Generate trajectories
+    # Model internally normalizes obs_traj, predicts, and denormalizes output
     with torch.no_grad():
-        output = model(obs_traj_norm, anchor, addl_info=addl_info)
+        output = model(obs_traj, anchor, addl_info=addl_info)
 
-    # Get generated trajectories
-    # Output shape: (num_samples, 1, pred_len, 2) or (1, pred_len, 2)
+    # Get generated trajectories - these are already in RAW pixel coordinates
+    # Output shape: (num_samples, 1, pred_len, 2)
     if "recon_traj" in output:
-        pred_traj_norm = output["recon_traj"]
+        pred_traj = output["recon_traj"]
     else:
-        # Fallback
-        pred_traj_norm = anchor.unsqueeze(0).expand(num_samples, -1, -1, -1)
+        # Fallback - shouldn't happen
+        print("Warning: No recon_traj in output, using anchor")
+        pred_traj = anchor.unsqueeze(0).expand(num_samples, -1, -1, -1)
 
     # Handle different output shapes
-    if pred_traj_norm.dim() == 3:
-        pred_traj_norm = pred_traj_norm.unsqueeze(0)
+    if pred_traj.dim() == 3:
+        pred_traj = pred_traj.unsqueeze(0)
 
-    # Denormalize trajectories
+    # Build full trajectories
     trajectories = []
-    for i in range(pred_traj_norm.shape[0]):
-        traj_norm = pred_traj_norm[i]  # (1, pred_len, 2) or (pred_len, 2)
-        if traj_norm.dim() == 2:
-            traj_norm = traj_norm.unsqueeze(0)
+    obs_np = obs_traj.squeeze(0).cpu().numpy()
 
-        # Denormalize
-        traj = normalizer.denormalize(traj_norm)
-        traj = traj.squeeze(0).cpu().numpy()
+    for i in range(pred_traj.shape[0]):
+        traj = pred_traj[i]  # (1, pred_len, 2) or (pred_len, 2)
+        if traj.dim() == 3:
+            traj = traj.squeeze(0)
+        traj = traj.cpu().numpy()
 
-        # Prepend observation
-        obs = obs_traj.squeeze(0).cpu().numpy()
-        full_traj = np.vstack([obs, traj])
+        # Prepend observation to get full trajectory
+        full_traj = np.vstack([obs_np, traj])
 
         # Adjust trajectory to hit target endpoint
         if adjust_endpoint:

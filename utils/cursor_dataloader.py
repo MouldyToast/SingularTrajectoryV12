@@ -201,6 +201,66 @@ def poly_fit(traj, traj_len, threshold):
     return 0.0
 
 
+def interpolate_trajectory(coords, target_len, method='cubic'):
+    """Interpolate a short trajectory to target length using B-spline or cubic interpolation.
+
+    This allows using trajectories that are shorter than seq_len by upsampling
+    them while preserving their shape characteristics.
+
+    Args:
+        coords: numpy array of shape (T, 2) - original trajectory
+        target_len: Target number of points
+        method: Interpolation method ('cubic', 'linear', 'bspline')
+
+    Returns:
+        Interpolated trajectory of shape (target_len, 2)
+    """
+    from scipy import interpolate as scipy_interp
+
+    orig_len = len(coords)
+    if orig_len >= target_len:
+        return coords[:target_len]
+
+    if orig_len < 2:
+        # Can't interpolate with single point - replicate
+        return np.tile(coords[0], (target_len, 1))
+
+    # Parameterize by normalized arc length
+    t_orig = np.linspace(0, 1, orig_len)
+    t_new = np.linspace(0, 1, target_len)
+
+    if method == 'bspline' and orig_len >= 4:
+        # Use B-spline for smoother interpolation (requires at least 4 points for k=3)
+        try:
+            from scipy.interpolate import make_interp_spline
+            k = min(3, orig_len - 1)  # Spline degree
+            spline_x = make_interp_spline(t_orig, coords[:, 0], k=k)
+            spline_y = make_interp_spline(t_orig, coords[:, 1], k=k)
+            new_x = spline_x(t_new)
+            new_y = spline_y(t_new)
+            return np.column_stack([new_x, new_y])
+        except Exception:
+            method = 'cubic'  # Fallback to cubic
+
+    if method == 'cubic' and orig_len >= 4:
+        # Cubic interpolation
+        try:
+            fx = scipy_interp.interp1d(t_orig, coords[:, 0], kind='cubic')
+            fy = scipy_interp.interp1d(t_orig, coords[:, 1], kind='cubic')
+            new_x = fx(t_new)
+            new_y = fy(t_new)
+            return np.column_stack([new_x, new_y])
+        except Exception:
+            method = 'linear'  # Fallback to linear
+
+    # Linear interpolation (works with 2+ points)
+    fx = scipy_interp.interp1d(t_orig, coords[:, 0], kind='linear')
+    fy = scipy_interp.interp1d(t_orig, coords[:, 1], kind='linear')
+    new_x = fx(t_new)
+    new_y = fy(t_new)
+    return np.column_stack([new_x, new_y])
+
+
 class CursorTrajectoryDataset(Dataset):
     """Dataset for cursor trajectory data.
 
@@ -304,13 +364,17 @@ class CursorTrajectoryDataset(Dataset):
         self.pred_traj = torch.from_numpy(np.array(pred_list)).float()  # (N, pred_len, 2)
 
     def _load_file(self, path):
-        """Load trajectories from a single file."""
+        """Load trajectories from a single file.
+
+        Short trajectories are interpolated to seq_len using B-spline/cubic interpolation
+        instead of being skipped. Minimum required length is 3 points.
+        """
         trajectories_dict = read_trajectory_file(path, self.delim)
+        min_points = 3  # Minimum points needed for meaningful interpolation
 
         for traj_id, points in trajectories_dict.items():
-            if len(points) < self.seq_len:
-                # Skip trajectories that are too short
-                # In future, could pad or use B-spline interpolation
+            if len(points) < min_points:
+                # Skip extremely short trajectories (< 3 points)
                 continue
 
             # Sort by frame index
@@ -323,8 +387,12 @@ class CursorTrajectoryDataset(Dataset):
             if self.skip > 1:
                 coords = coords[::self.skip]
 
-            if len(coords) < self.seq_len:
+            if len(coords) < min_points:
                 continue
+
+            # Interpolate short trajectories to seq_len using B-spline
+            if len(coords) < self.seq_len:
+                coords = interpolate_trajectory(coords, self.seq_len, method='bspline')
 
             # Truncate to max length if needed
             if len(coords) > self.max_traj_len:

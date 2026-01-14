@@ -241,6 +241,7 @@ class CursorTransformerDiffusionTrainer(STTrainer):
         Mirrors AdaptiveAnchor.adaptive_anchor_calculation but simplified for cursor:
         - No world/image coordinate transform (identity homography)
         - Vector field in normalized cursor space
+        - Properly handles per-trajectory scene IDs with bilinear interpolation
         """
         n_ped = obs_traj.size(0)
         V_trunc = space.V_trunc
@@ -259,11 +260,15 @@ class CursorTransformerDiffusionTrainer(STTrainer):
         adaptive_anchor_euclidean = init_anchor_euclidean.copy()
         obs_traj_np = obs_traj.cpu().numpy()
 
-        # Get vector field for this scene
-        scene_name = scene_id[0] if len(scene_id) > 0 else None
-        vf = vector_field.get(scene_name) if scene_name else None
+        # Process each trajectory with its own scene's vector field
+        for ped_id in range(n_ped):
+            # Get vector field for THIS trajectory's scene (not just first one)
+            scene_name = scene_id[ped_id] if ped_id < len(scene_id) else None
+            vf = vector_field.get(scene_name) if scene_name else None
 
-        if vf is not None:
+            if vf is None:
+                continue
+
             # Vector field grid parameters (from generate_cursor_vector_field.py)
             # Normalized space: x in [-0.2, 1.2], y in [-0.6, 0.6]
             grid_h, grid_w = vf.shape[:2]
@@ -272,40 +277,54 @@ class CursorTransformerDiffusionTrainer(STTrainer):
             cell_w = (x_max - x_min) / grid_w
             cell_h = (y_max - y_min) / grid_h
 
-            for ped_id in range(n_ped):
-                startpoint = obs_traj_np[ped_id, -1]  # Last observed point
+            startpoint = obs_traj_np[ped_id, -1]  # Last observed point
 
-                for sample_idx in range(s):
-                    # Get prototype trajectory endpoint
-                    prototype = init_anchor_euclidean[sample_idx, ped_id]  # (pred_len, 2)
-                    endpoint = prototype[-1]  # End of this anchor
+            for sample_idx in range(s):
+                # Get prototype trajectory endpoint
+                prototype = init_anchor_euclidean[sample_idx, ped_id]  # (pred_len, 2)
+                endpoint = prototype[-1]  # End of this anchor
 
-                    # Convert to grid coordinates
-                    grid_x = int((endpoint[0] - x_min) / cell_w)
-                    grid_y = int((endpoint[1] - y_min) / cell_h)
+                # Convert to grid coordinates (float for interpolation)
+                grid_x_f = (endpoint[0] - x_min) / cell_w
+                grid_y_f = (endpoint[1] - y_min) / cell_h
 
-                    # Clamp to grid bounds
-                    grid_x = max(0, min(grid_w - 1, grid_x))
-                    grid_y = max(0, min(grid_h - 1, grid_y))
+                # Bilinear interpolation for smoother vector field lookup
+                grid_x0 = int(np.floor(grid_x_f))
+                grid_y0 = int(np.floor(grid_y_f))
+                grid_x1 = grid_x0 + 1
+                grid_y1 = grid_y0 + 1
 
-                    # Get flow target from vector field
-                    # vf[y, x] = (target_x, target_y) or (flow_dx, flow_dy)
-                    flow_target = vf[grid_y, grid_x]
+                # Clamp to grid bounds
+                grid_x0 = max(0, min(grid_w - 1, grid_x0))
+                grid_x1 = max(0, min(grid_w - 1, grid_x1))
+                grid_y0 = max(0, min(grid_h - 1, grid_y0))
+                grid_y1 = max(0, min(grid_h - 1, grid_y1))
 
-                    # Check if this is a valid flow (non-zero)
-                    if np.linalg.norm(flow_target) > 0.01:
-                        # Scale trajectory endpoints to match flow
-                        # Original approach: scale trajectory proportionally
-                        if np.linalg.norm(endpoint - startpoint) > 0.01:
-                            scale_xy = (flow_target - startpoint) / (endpoint - startpoint + 1e-6)
-                            # Clamp scale to reasonable range
-                            scale_xy = np.clip(scale_xy, 0.5, 2.0)
+                # Interpolation weights
+                wx = grid_x_f - np.floor(grid_x_f)
+                wy = grid_y_f - np.floor(grid_y_f)
 
-                            # Apply scaling to entire trajectory
-                            for t in range(prototype.shape[0]):
-                                adaptive_anchor_euclidean[sample_idx, ped_id, t] = (
-                                    (prototype[t] - startpoint) * scale_xy + startpoint
-                                )
+                # Bilinear interpolation of flow target
+                flow_target = (
+                    vf[grid_y0, grid_x0] * (1 - wx) * (1 - wy) +
+                    vf[grid_y0, grid_x1] * wx * (1 - wy) +
+                    vf[grid_y1, grid_x0] * (1 - wx) * wy +
+                    vf[grid_y1, grid_x1] * wx * wy
+                )
+
+                # Check if this is a valid flow (non-zero)
+                if np.linalg.norm(flow_target) > 0.01:
+                    # Scale trajectory endpoints to match flow
+                    if np.linalg.norm(endpoint - startpoint) > 0.01:
+                        scale_xy = (flow_target - startpoint) / (endpoint - startpoint + 1e-6)
+                        # Clamp scale to reasonable range
+                        scale_xy = np.clip(scale_xy, 0.5, 2.0)
+
+                        # Apply scaling to entire trajectory
+                        for t in range(prototype.shape[0]):
+                            adaptive_anchor_euclidean[sample_idx, ped_id, t] = (
+                                (prototype[t] - startpoint) * scale_xy + startpoint
+                            )
 
         # Convert back to Singular space
         adaptive_anchor_euclidean = space.traj_normalizer.normalize(
@@ -342,12 +361,24 @@ class CursorTransformerDiffusionTrainer(STTrainer):
         return anchor
 
     def train(self, epoch):
-        """Training step - same as STTransformerDiffusionTrainer."""
+        """Training step with complete loss function.
+
+        Uses all three loss components from original SingularTrajectory:
+        - loss_eigentraj: Coefficient space error (low-rank approximation)
+        - loss_euclidean_ade: Average displacement error in Euclidean space
+        - loss_euclidean_fde: Final displacement error in Euclidean space
+        """
         self.model.train()
         loss_batch = 0
 
         if self.loader_train.dataset.anchor is None:
             self.init_adaptive_anchor(self.loader_train.dataset)
+
+        # Loss weights (can be tuned or made configurable)
+        # Higher FDE weight emphasizes endpoint accuracy (critical for cursor generation)
+        w_eigentraj = 0.1  # Coefficient space loss
+        w_ade = 1.0        # Average displacement error
+        w_fde = 1.0        # Final displacement error (endpoint accuracy)
 
         for cnt, batch in enumerate(tqdm(self.loader_train, desc=f'Train Epoch {epoch}', mininterval=1)):
             obs_traj = batch["obs_traj"].cuda(non_blocking=True)
@@ -363,8 +394,20 @@ class CursorTransformerDiffusionTrainer(STTrainer):
             }
             output = self.model(obs_traj, adaptive_anchor, pred_traj, addl_info=additional_information)
 
-            loss = output["loss_euclidean_ade"]
-            loss[torch.isnan(loss)] = 0
+            # Combined loss with all three components
+            loss_eigentraj = output.get("loss_eigentraj", torch.tensor(0.0).cuda())
+            loss_ade = output["loss_euclidean_ade"]
+            loss_fde = output.get("loss_euclidean_fde", torch.tensor(0.0).cuda())
+
+            # Handle NaN values
+            if torch.isnan(loss_eigentraj):
+                loss_eigentraj = torch.tensor(0.0).cuda()
+            if torch.isnan(loss_ade):
+                loss_ade = torch.tensor(0.0).cuda()
+            if torch.isnan(loss_fde):
+                loss_fde = torch.tensor(0.0).cuda()
+
+            loss = w_eigentraj * loss_eigentraj + w_ade * loss_ade + w_fde * loss_fde
             loss_batch += loss.item()
 
             loss.backward()
